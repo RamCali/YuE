@@ -25,8 +25,10 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     libsndfile1 \
     git \
+    git-lfs \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && git lfs install
 
 # Copy requirements first (for better caching)
 COPY requirements-runpod.txt .
@@ -41,6 +43,11 @@ RUN pip install flash-attn --no-build-isolation || echo "flash-attn install fail
 
 # Copy the entire YuE repository
 COPY . .
+
+# Download xcodec_mini_infer model from HuggingFace (required for audio decoding)
+RUN cd /app/inference && \
+    git clone https://huggingface.co/m-a-p/xcodec_mini_infer && \
+    echo "xcodec_mini_infer downloaded successfully"
 
 # Create cache directory
 RUN mkdir -p /runpod-volume/cache
