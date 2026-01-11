@@ -52,10 +52,10 @@ RUN cd /app/inference && \
 # Create cache directory
 RUN mkdir -p /runpod-volume/cache
 
-# Pre-download models during build (optional - speeds up cold starts)
-# Uncomment to bake models into image (increases image size significantly)
-# RUN python -c "from transformers import AutoModelForCausalLM; AutoModelForCausalLM.from_pretrained('m-a-p/YuE-s1-7B-anneal-en-cot')"
-# RUN python -c "from transformers import AutoModelForCausalLM; AutoModelForCausalLM.from_pretrained('m-a-p/YuE-s2-1B-general')"
+# Pre-download models during build (speeds up cold starts significantly)
+# This adds ~15GB to image size but reduces cold start from 3-5 min to 30-60 sec
+ENV HF_HOME=/app/models
+RUN python -c "from transformers import AutoModelForCausalLM; AutoModelForCausalLM.from_pretrained('m-a-p/YuE-s1-7B-anneal-en-cot', torch_dtype='auto')"
 
 # Set the handler as entry point
 CMD ["python", "-u", "handler.py"]

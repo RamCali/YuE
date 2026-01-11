@@ -89,7 +89,8 @@ def load_models():
     codec_config_path = os.path.join(inference_path, "xcodec_mini_infer", "final_ckpt", "config.yaml")
     codec_ckpt_path = os.path.join(inference_path, "xcodec_mini_infer", "final_ckpt", "ckpt_00360000.pth")
 
-    # Model names
+    # Model names - use HF_HOME if models are pre-baked
+    os.environ["HF_HOME"] = os.environ.get("HF_HOME", "/app/models")
     stage1_model_name = os.environ.get("STAGE1_MODEL", "m-a-p/YuE-s1-7B-anneal-en-cot")
 
     # Load tokenizer
