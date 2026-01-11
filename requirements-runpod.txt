@@ -1,0 +1,28 @@
+# YuE RunPod Serverless Dependencies
+
+# RunPod SDK
+runpod>=1.6.0
+
+# ML Framework
+torch>=2.1.0
+torchaudio>=2.1.0
+transformers>=4.36.0
+accelerate>=0.26.0
+
+# YuE specific
+omegaconf>=2.3.0
+einops>=0.7.0
+sentencepiece>=0.1.99
+
+# Audio processing
+soundfile>=0.12.1
+librosa>=0.10.1
+scipy>=1.11.0
+numpy>=1.24.0
+
+# Codec dependencies
+descript-audiotools>=0.7.2
+descript-audio-codec>=1.0.0
+
+# Utilities
+tqdm>=4.66.0
