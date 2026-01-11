@@ -140,10 +140,12 @@ def load_models():
     codec_model.eval()
 
     # Compile models for faster inference (PyTorch 2.0+)
-    if hasattr(torch, 'compile') and torch.__version__ >= "2.0.0":
-        logger.info("Compiling models with torch.compile...")
-        model_stage1 = torch.compile(model_stage1)
-        model_stage2 = torch.compile(model_stage2)
+    # Skip torch.compile - it can cause issues with some dependency combinations
+    # and the performance benefit is minimal for our short audio generation use case
+    # if hasattr(torch, 'compile') and torch.__version__ >= "2.0.0":
+    #     logger.info("Compiling models with torch.compile...")
+    #     model_stage1 = torch.compile(model_stage1)
+    #     model_stage2 = torch.compile(model_stage2)
 
     elapsed = time.time() - start_time
     logger.info(f"Models loaded in {elapsed:.2f}s")
