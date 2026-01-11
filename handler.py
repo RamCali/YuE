@@ -22,14 +22,17 @@ import base64
 import time
 import random
 import logging
+import uuid
 from typing import Optional, Dict, Any
 
 import numpy as np
 import torch
-import torchaudio
 
 # Add inference directory to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "inference"))
+inference_path = os.path.join(os.path.dirname(__file__), "inference")
+sys.path.insert(0, inference_path)
+sys.path.insert(0, os.path.join(inference_path, 'xcodec_mini_infer'))
+sys.path.insert(0, os.path.join(inference_path, 'xcodec_mini_infer', 'descriptaudiocodec'))
 
 import runpod
 
@@ -40,8 +43,7 @@ logger = logging.getLogger(__name__)
 # ============================================
 # Global Model References (loaded once)
 # ============================================
-model_stage1 = None
-model_stage2 = None
+model = None
 codec_model = None
 mmtokenizer = None
 codectool = None
@@ -55,13 +57,15 @@ def seed_everything(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def load_models():
     """Load YuE models (called once on cold start)."""
-    global model_stage1, model_stage2, codec_model, mmtokenizer, codectool, device
+    global model, codec_model, mmtokenizer, codectool, device
 
-    if model_stage1 is not None:
+    if model is not None:
         logger.info("Models already loaded, skipping...")
         return
 
@@ -77,17 +81,16 @@ def load_models():
     from omegaconf import OmegaConf
     from mmtokenizer import _MMSentencePieceTokenizer
     from codecmanipulator import CodecManipulator
+    from models.soundstream_hubert_new import SoundStream
 
     # Paths
     base_path = os.path.dirname(__file__)
-    inference_path = os.path.join(base_path, "inference")
     tokenizer_path = os.path.join(inference_path, "mm_tokenizer_v0.2_hf", "tokenizer.model")
     codec_config_path = os.path.join(inference_path, "xcodec_mini_infer", "final_ckpt", "config.yaml")
     codec_ckpt_path = os.path.join(inference_path, "xcodec_mini_infer", "final_ckpt", "ckpt_00360000.pth")
 
-    # Model names (can be overridden via env vars)
+    # Model names
     stage1_model_name = os.environ.get("STAGE1_MODEL", "m-a-p/YuE-s1-7B-anneal-en-cot")
-    stage2_model_name = os.environ.get("STAGE2_MODEL", "m-a-p/YuE-s2-1B-general")
 
     # Load tokenizer
     logger.info("Loading tokenizer...")
@@ -107,45 +110,21 @@ def load_models():
 
     # Load Stage 1 model
     logger.info(f"Loading Stage 1 model: {stage1_model_name}")
-    model_stage1 = AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         stage1_model_name,
         torch_dtype=torch.bfloat16,
         attn_implementation=attn_impl,
     )
-    model_stage1.to(device)
-    model_stage1.eval()
-
-    # Load Stage 2 model
-    logger.info(f"Loading Stage 2 model: {stage2_model_name}")
-    model_stage2 = AutoModelForCausalLM.from_pretrained(
-        stage2_model_name,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=attn_impl,
-    )
-    model_stage2.to(device)
-    model_stage2.eval()
+    model.to(device)
+    model.eval()
 
     # Load codec model
     logger.info("Loading codec model...")
     model_config = OmegaConf.load(codec_config_path)
-
-    # Import codec
-    from xcodec_mini_infer.modeling_xcodec import XCodec
-    codec_model = XCodec(
-        **model_config.generator.config
-    ).to(device)
-
+    codec_model = SoundStream(**model_config.generator.config).to(device)
     parameter_dict = torch.load(codec_ckpt_path, map_location='cpu', weights_only=False)
     codec_model.load_state_dict(parameter_dict['codec_model'])
     codec_model.eval()
-
-    # Compile models for faster inference (PyTorch 2.0+)
-    # Skip torch.compile - it can cause issues with some dependency combinations
-    # and the performance benefit is minimal for our short audio generation use case
-    # if hasattr(torch, 'compile') and torch.__version__ >= "2.0.0":
-    #     logger.info("Compiling models with torch.compile...")
-    #     model_stage1 = torch.compile(model_stage1)
-    #     model_stage2 = torch.compile(model_stage2)
 
     elapsed = time.time() - start_time
     logger.info(f"Models loaded in {elapsed:.2f}s")
@@ -154,23 +133,20 @@ def load_models():
 def split_lyrics(lyrics: str) -> list:
     """Split lyrics into segments by section markers."""
     import re
-    pattern = r'\[(\w+)\]'
-    segments = []
-    current_segment = ""
+    pattern = r"\[(\w+)\](.*?)(?=\[|\Z)"
+    segments = re.findall(pattern, lyrics, re.DOTALL)
+    structured_lyrics = [f"[{seg[0]}]\n{seg[1].strip()}\n\n" for seg in segments]
+    return structured_lyrics if structured_lyrics else [lyrics]
 
-    for line in lyrics.split('\n'):
-        line = line.strip()
-        if re.match(pattern, line):
-            if current_segment.strip():
-                segments.append(current_segment.strip())
-            current_segment = line + "\n"
-        else:
-            current_segment += line + "\n"
 
-    if current_segment.strip():
-        segments.append(current_segment.strip())
+class BlockTokenRangeProcessor:
+    """Logits processor to block certain token ranges."""
+    def __init__(self, start_id, end_id):
+        self.blocked_token_ids = list(range(start_id, end_id))
 
-    return segments if segments else [lyrics]
+    def __call__(self, input_ids, scores):
+        scores[:, self.blocked_token_ids] = -float("inf")
+        return scores
 
 
 def generate_singing(
@@ -182,138 +158,148 @@ def generate_singing(
 ) -> Dict[str, Any]:
     """
     Generate singing audio from lyrics using YuE.
-
-    Args:
-        lyrics: Lyrics with section markers like [verse], [chorus]
-        genres: Style/genre tags for generation
-        max_new_tokens: Max tokens per segment
-        run_n_segments: Number of segments to generate (for OOM prevention)
-        seed: Random seed for reproducibility
-
-    Returns:
-        Dict with audio_base64, duration, sample_rate
     """
-    global model_stage1, model_stage2, codec_model, mmtokenizer, codectool, device
+    global model, codec_model, mmtokenizer, codectool, device
 
     from einops import rearrange
     from transformers import LogitsProcessorList
+    import soundfile as sf
 
     # Set seed if provided
     if seed is not None:
         seed_everything(seed)
+    else:
+        seed_everything(42)
 
     start_time = time.time()
 
     # Parse lyrics into segments
-    segments = split_lyrics(lyrics)
-    logger.info(f"Processing {len(segments)} lyric segments")
+    lyrics_segments = split_lyrics(lyrics)
+    logger.info(f"Processing {len(lyrics_segments)} lyric segments")
 
-    # Limit segments for memory
-    segments = segments[:run_n_segments]
+    # Limit segments
+    run_n_segments = min(run_n_segments, len(lyrics_segments))
 
-    # Build prompt
-    full_lyrics = "\n\n".join(segments)
-    prompt_text = f"Generate music from the given lyrics segment by segment.\n[Genre] {genres}\n{full_lyrics}"
+    # Build prompt following original YuE format
+    full_lyrics = "\n".join(lyrics_segments[:run_n_segments])
+    prompt_texts = [f"Generate music from the given lyrics segment by segment.\n[Genre] {genres}\n{full_lyrics}"]
+    prompt_texts += lyrics_segments[:run_n_segments]
 
-    # Tokenize
-    prompt_ids = mmtokenizer.tokenize(prompt_text)
+    # Special tokens
+    start_of_segment = mmtokenizer.tokenize('[start_of_segment]')
+    end_of_segment = mmtokenizer.tokenize('[end_of_segment]')
 
-    # Stage 1: Generate audio codes
+    # Generation config
+    top_p = 0.93
+    temperature = 1.0
+    repetition_penalty = 1.1
+
     logger.info("Stage 1: Generating audio codes...")
     stage1_start = time.time()
 
-    all_codes = []
+    raw_output = None
 
-    for i, segment in enumerate(segments):
-        logger.info(f"Processing segment {i+1}/{len(segments)}")
-
-        # Format segment
-        segment_text = f"[start_of_segment]{segment}[end_of_segment]"
-        segment_ids = mmtokenizer.tokenize(segment_text)
-
-        # Prepare input
+    for i, p in enumerate(prompt_texts[:run_n_segments + 1]):
         if i == 0:
-            input_ids = torch.tensor([prompt_ids + segment_ids], dtype=torch.long, device=device)
-        else:
-            # Continue from previous output
-            input_ids = torch.cat([input_ids, torch.tensor([segment_ids], dtype=torch.long, device=device)], dim=1)
+            continue  # Skip the header prompt, it's included in i==1
 
-        # Generate
+        section_text = p.replace('[start_of_segment]', '').replace('[end_of_segment]', '')
+        guidance_scale = 1.5 if i <= 1 else 1.2
+
+        logger.info(f"Processing segment {i}/{run_n_segments}")
+
+        if i == 1:
+            # First segment: include full header
+            head_id = mmtokenizer.tokenize(prompt_texts[0])
+            prompt_ids = head_id + start_of_segment + mmtokenizer.tokenize(section_text) + [mmtokenizer.soa] + codectool.sep_ids
+        else:
+            # Subsequent segments
+            prompt_ids = end_of_segment + start_of_segment + mmtokenizer.tokenize(section_text) + [mmtokenizer.soa] + codectool.sep_ids
+
+        prompt_ids = torch.as_tensor(prompt_ids).unsqueeze(0).to(device)
+        input_ids = torch.cat([raw_output, prompt_ids], dim=1) if i > 1 else prompt_ids
+
+        # Window slicing for context limit
+        max_context = 16384 - max_new_tokens - 1
+        if input_ids.shape[-1] > max_context:
+            logger.info(f'Section {i}: output length {input_ids.shape[-1]} exceeding context, using last {max_context} tokens.')
+            input_ids = input_ids[:, -max_context:]
+
         with torch.no_grad():
-            output = model_stage1.generate(
+            output_seq = model.generate(
                 input_ids=input_ids,
                 max_new_tokens=max_new_tokens,
+                min_new_tokens=100,
                 do_sample=True,
-                top_p=0.93,
-                temperature=1.0,
-                repetition_penalty=1.1,
+                top_p=top_p,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
                 eos_token_id=mmtokenizer.eoa,
                 pad_token_id=mmtokenizer.eoa,
+                logits_processor=LogitsProcessorList([
+                    BlockTokenRangeProcessor(0, 32002),
+                    BlockTokenRangeProcessor(32016, 32016)
+                ]),
+                guidance_scale=guidance_scale,
             )
 
-        # Extract codes from output
-        output_ids = output[0].cpu().numpy()
+            # Ensure EOA token at end
+            if output_seq[0][-1].item() != mmtokenizer.eoa:
+                tensor_eoa = torch.as_tensor([[mmtokenizer.eoa]]).to(device)
+                output_seq = torch.cat((output_seq, tensor_eoa), dim=1)
 
-        # Find audio codes (between start_of_audio and end_of_audio tokens)
-        soa_token = mmtokenizer.soa
-        eoa_token = mmtokenizer.eoa
-
-        # Find SOA and EOA positions
-        soa_idx = np.where(output_ids == soa_token)[0]
-        eoa_idx = np.where(output_ids == eoa_token)[0]
-
-        if len(soa_idx) > 0 and len(eoa_idx) > 0:
-            # Extract codec IDs
-            codes_start = soa_idx[-1] + 1
-            codes_end = eoa_idx[-1] if eoa_idx[-1] > codes_start else len(output_ids)
-            codec_ids = output_ids[codes_start:codes_end]
-
-            if len(codec_ids) > 0:
-                # Convert to numpy array for codec
-                codes = codectool.ids2npy(codec_ids)
-                all_codes.append(codes)
-
-        # Update input for next segment
-        input_ids = output
+        if i > 1:
+            raw_output = torch.cat([raw_output, prompt_ids, output_seq[:, input_ids.shape[-1]:]], dim=1)
+        else:
+            raw_output = output_seq
 
     stage1_time = time.time() - stage1_start
     logger.info(f"Stage 1 completed in {stage1_time:.2f}s")
 
-    if not all_codes:
+    # Extract audio codes
+    ids = raw_output[0].cpu().numpy()
+    soa_idx = np.where(ids == mmtokenizer.soa)[0].tolist()
+    eoa_idx = np.where(ids == mmtokenizer.eoa)[0].tolist()
+
+    if len(soa_idx) != len(eoa_idx):
+        raise ValueError(f'Invalid pairs of soa and eoa: {len(soa_idx)} vs {len(eoa_idx)}')
+
+    if len(soa_idx) == 0:
         raise ValueError("No audio codes generated from Stage 1")
 
-    # Concatenate all codes
-    combined_codes = np.concatenate(all_codes, axis=-1)
+    logger.info(f"Found {len(soa_idx)} audio segments")
 
-    # Stage 2: Refine codes
-    logger.info("Stage 2: Refining audio codes...")
-    stage2_start = time.time()
+    # Extract vocals (we only need vocals for birthday song)
+    vocals = []
+    for i in range(len(soa_idx)):
+        codec_ids = ids[soa_idx[i] + 1:eoa_idx[i]]
+        if len(codec_ids) == 0:
+            continue
+        if codec_ids[0] == 32016:
+            codec_ids = codec_ids[1:]
+        codec_ids = codec_ids[:2 * (codec_ids.shape[0] // 2)]
+        if len(codec_ids) == 0:
+            continue
+        # Extract vocals (interleaved format: vocal, instrumental, vocal, instrumental...)
+        vocals_ids = codectool.ids2npy(rearrange(codec_ids, "(n b) -> b n", b=2)[0])
+        vocals.append(vocals_ids)
 
-    # Stage 2 upsampling
-    with torch.no_grad():
-        codes_tensor = torch.from_numpy(combined_codes).to(device)
+    if not vocals:
+        raise ValueError("No vocal codes extracted")
 
-        # Generate additional codebook levels
-        refined_codes = codes_tensor  # Simplified - full implementation would upsample
+    vocals = np.concatenate(vocals, axis=1)
+    logger.info(f"Extracted vocal codes shape: {vocals.shape}")
 
-        # For birthday songs, we may skip full Stage 2 for speed
-        # The quality is still acceptable for short clips
-
-    stage2_time = time.time() - stage2_start
-    logger.info(f"Stage 2 completed in {stage2_time:.2f}s")
-
-    # Vocoding: Convert codes to audio
+    # Decode vocals to audio
     logger.info("Vocoding: Converting to audio...")
     vocoder_start = time.time()
 
     with torch.no_grad():
-        # Ensure codes are in correct shape [batch, codebooks, time]
-        if len(refined_codes.shape) == 2:
-            refined_codes = refined_codes.unsqueeze(0)
-
-        # Decode to waveform
-        audio = codec_model.decode(refined_codes.to(device))
-        audio = audio.squeeze().cpu().numpy()
+        # Reshape for codec model: [batch, codebooks, time]
+        vocals_tensor = torch.from_numpy(vocals).unsqueeze(0).to(device)
+        # Decode
+        decoded_audio = codec_model.decode(vocals_tensor)
+        audio = decoded_audio.squeeze().cpu().numpy()
 
     vocoder_time = time.time() - vocoder_start
     logger.info(f"Vocoding completed in {vocoder_time:.2f}s")
@@ -322,13 +308,9 @@ def generate_singing(
     if np.abs(audio).max() > 0:
         audio = audio / np.abs(audio).max() * 0.95
 
-    # Convert to 16-bit PCM
-    audio_int16 = (audio * 32767).astype(np.int16)
-
     # Encode to base64 WAV
     buffer = io.BytesIO()
-    import soundfile as sf
-    sf.write(buffer, audio_int16, 16000, format='WAV')
+    sf.write(buffer, audio, 16000, format='WAV')
     buffer.seek(0)
     audio_base64 = base64.b64encode(buffer.read()).decode('utf-8')
 
@@ -343,7 +325,6 @@ def generate_singing(
         "sample_rate": 16000,
         "generation_time": total_time,
         "stage1_time": stage1_time,
-        "stage2_time": stage2_time,
         "vocoder_time": vocoder_time,
     }
 
