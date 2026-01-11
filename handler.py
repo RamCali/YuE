@@ -96,12 +96,21 @@ def load_models():
     # Load codec manipulator
     codectool = CodecManipulator("xcodec", 0, 1)
 
+    # Check if flash attention is available
+    try:
+        import flash_attn
+        attn_impl = "flash_attention_2"
+        logger.info("Flash attention available, using flash_attention_2")
+    except ImportError:
+        attn_impl = "eager"
+        logger.info("Flash attention not available, using eager attention")
+
     # Load Stage 1 model
     logger.info(f"Loading Stage 1 model: {stage1_model_name}")
     model_stage1 = AutoModelForCausalLM.from_pretrained(
         stage1_model_name,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_impl,
     )
     model_stage1.to(device)
     model_stage1.eval()
@@ -111,7 +120,7 @@ def load_models():
     model_stage2 = AutoModelForCausalLM.from_pretrained(
         stage2_model_name,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_impl,
     )
     model_stage2.to(device)
     model_stage2.eval()

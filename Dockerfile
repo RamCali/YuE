@@ -34,8 +34,10 @@ COPY requirements-runpod.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements-runpod.txt
 
-# Install flash-attention (required for reduced VRAM usage)
-RUN pip install flash-attn --no-build-isolation
+# Install flash-attention (optional - skip if build fails)
+# flash-attn requires CUDA compilation, may fail in some build environments
+# The model will still work without it, just use more VRAM
+RUN pip install flash-attn --no-build-isolation || echo "flash-attn install failed, continuing without it"
 
 # Copy the entire YuE repository
 COPY . .
